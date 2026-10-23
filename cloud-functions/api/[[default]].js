@@ -1,324 +1,311 @@
 import { getStore } from "@edgeone/pages-blob";
-import { createHash, createHmac, timingSafeEqual, randomBytes } from "crypto";
 
 const STORE_NAME = "excalidraw-docs";
 const INDEX_KEY = "_index.json";
 const COOKIE_NAME = "ex_sync_session";
-const SESSION_TTL_SEC = 30 * 24 * 3600;
+const SESSION_TTL_SEC = 60 * 60 * 24 * 30; // 30 days
+const MAX_BODY_BYTES = 15 * 1024 * 1024; // 15 MB
 
-const store = getStore({ name: STORE_NAME, consistency: "strong" });
+const enc = new TextEncoder();
 
 function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
-      "Content-Type": "application/json; charset=utf-8",
-      "Cache-Control": "no-store",
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
       ...extraHeaders,
     },
   });
 }
 
-function getHeader(headers, name) {
-  if (!headers) return "";
-  const lower = name.toLowerCase();
-  if (typeof headers.get === "function") return headers.get(name) || headers.get(lower) || "";
-  return headers[name] || headers[lower] || headers[name.toLowerCase()] || "";
+function err(message, status = 400) {
+  return json({ error: message }, status);
 }
 
-function getCookie(request, name) {
-  const raw = getHeader(request.headers, "cookie") || "";
-  for (const part of raw.split(";")) {
-    const [k, ...rest] = part.trim().split("=");
-    if (k === name) return decodeURIComponent(rest.join("="));
-  }
-  return "";
+async function sha256Hex(str) {
+  const buf = await crypto.subtle.digest("SHA-256", enc.encode(str));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-function setCookie(name, value, maxAge) {
-  return [
-    `${name}=${encodeURIComponent(value)}`,
-    "Path=/",
-    "HttpOnly",
-    "Secure",
-    "SameSite=Lax",
-    `Max-Age=${maxAge}`,
-  ].join("; ");
+async function hmacHex(secret, msg) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(msg));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-function clearCookie(name) {
-  return `${name}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`;
+function safeEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
 }
 
-function sha256Hex(s) {
-  return createHash("sha256").update(String(s), "utf8").digest("hex");
-}
-
-function safeEqualHex(a, b) {
-  try {
-    const ba = Buffer.from(String(a), "utf8");
-    const bb = Buffer.from(String(b), "utf8");
-    if (ba.length !== bb.length) return false;
-    return timingSafeEqual(ba, bb);
-  } catch {
-    return false;
-  }
-}
-
-function b64url(buf) {
-  return Buffer.from(buf)
-    .toString("base64")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-}
-
-function fromB64url(s) {
-  s = String(s).replace(/-/g, "+").replace(/_/g, "/");
-  while (s.length % 4) s += "=";
-  return Buffer.from(s, "base64");
-}
-
-function signPayload(payload, secret) {
-  return createHmac("sha256", secret).update(payload).digest("base64url");
-}
-
-function makeToken(data, secret, ttlSec) {
-  const body = { ...data, exp: Math.floor(Date.now() / 1000) + ttlSec };
-  const payload = b64url(Buffer.from(JSON.stringify(body), "utf8"));
-  const sig = signPayload(payload, secret);
+async function makeToken(secret) {
+  const exp = Date.now() + SESSION_TTL_SEC * 1000;
+  const payload = `owner.${exp}`;
+  const sig = await hmacHex(secret, payload);
   return `${payload}.${sig}`;
 }
 
-function readToken(token, secret) {
-  if (!token || !token.includes(".")) return null;
-  const [payload, sig] = token.split(".");
-  const expect = signPayload(payload, secret);
-  const a = Buffer.from(String(sig), "utf8");
-  const b = Buffer.from(String(expect), "utf8");
-  if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
+async function verifyToken(token, secret) {
+  if (!token || typeof token !== "string") return null;
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  const [sub, expStr, sig] = parts;
+  if (sub !== "owner") return null;
+  const exp = Number(expStr);
+  if (!Number.isFinite(exp) || Date.now() > exp) return null;
+  const expected = await hmacHex(secret, `${sub}.${expStr}`);
+  if (!safeEqual(sig, expected)) return null;
+  return { sub, exp };
+}
+
+function parseCookies(header) {
+  const out = {};
+  if (!header) return out;
+  for (const part of header.split(";")) {
+    const idx = part.indexOf("=");
+    if (idx === -1) continue;
+    const k = part.slice(0, idx).trim();
+    const v = part.slice(idx + 1).trim();
+    out[k] = decodeURIComponent(v);
+  }
+  return out;
+}
+
+function makeCookieHeader(value, maxAge = SESSION_TTL_SEC) {
+  return `${COOKIE_NAME}=${encodeURIComponent(value)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`;
+}
+
+async function requireAuth(context) {
+  const secret = context.env?.SESSION_SECRET;
+  if (!secret) throw new Error("SESSION_SECRET not configured");
+  const cookies = parseCookies(context.request.headers.get("cookie"));
+  const v = await verifyToken(cookies[COOKIE_NAME], secret);
+  if (v) return v;
+  const sharePwd = context.request.headers.get("x-share-password");
+  const expectedHash = (context.env?.AUTH_PASSWORD_HASH || "").trim().toLowerCase();
+  if (sharePwd && expectedHash) {
+    const gotHash = await sha256Hex(String(sharePwd));
+    if (safeEqual(gotHash, expectedHash)) {
+      return { sub: "owner", exp: Date.now() + SESSION_TTL_SEC * 1000 };
+    }
+  }
+  return null;
+}
+
+function store() {
+  return getStore({ name: STORE_NAME });
+}
+
+async function getJson(key, fallback) {
+  const s = store();
   try {
-    const body = JSON.parse(fromB64url(payload).toString("utf8"));
-    if (!body.exp || body.exp < Math.floor(Date.now() / 1000)) return null;
-    if (body.v !== 1) return null;
-    return body;
+    const raw = await s.get(key, { type: "text" });
+    if (!raw) return fallback;
+    return JSON.parse(raw);
   } catch {
-    return null;
+    return fallback;
   }
 }
 
-function getEnv(context) {
-  return context?.env || {};
-}
-
-function requireAuth(context) {
-  const env = getEnv(context);
-  const secret = env.SESSION_SECRET;
-  if (!secret) return { ok: false, status: 500, error: "SESSION_SECRET not configured" };
-  const token = getCookie(context.request, COOKIE_NAME);
-  const session = readToken(token, secret);
-  if (!session) return { ok: false, status: 401, error: "unauthorized" };
-  return { ok: true, session };
+async function putJson(key, val) {
+  const s = store();
+  await s.set(key, JSON.stringify(val));
 }
 
 async function readIndex() {
-  const data = await store.get(INDEX_KEY, { type: "json", consistency: "strong" });
-  if (!data || !Array.isArray(data.docs)) return { docs: [] };
-  return data;
+  const idx = await getJson(INDEX_KEY, { docs: [] });
+  if (!idx || !Array.isArray(idx.docs)) return { docs: [] };
+  return idx;
 }
 
-async function writeIndex(index) {
-  await store.setJSON(INDEX_KEY, index);
+function docKey(id) {
+  return `docs/${id}.json`;
 }
 
-function newId() {
-  return randomBytes(8).toString("hex");
-}
-
-async function parseBody(request) {
-  if (request.body && typeof request.body === "object" && !request.body.getReader) {
-    return request.body;
+async function getBootstrapPayload() {
+  const idx = await readIndex();
+  const docs = [...idx.docs].sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
+  let initialDoc = null;
+  if (docs.length > 0 && docs[0]?.id) {
+    initialDoc = await getJson(docKey(docs[0].id), null);
   }
-  try {
-    if (typeof request.json === "function") return await request.json();
-  } catch {
-    /* ignore */
-  }
-  try {
-    const text = typeof request.text === "function" ? await request.text() : "";
-    return text ? JSON.parse(text) : {};
-  } catch {
-    return {};
-  }
+  return { docs, initialDoc };
 }
 
-function apiPath(pathname) {
-  return pathname.replace(/^\/api/, "") || "/";
+function validId(id) {
+  return typeof id === "string" && /^[a-zA-Z0-9_-]{4,64}$/.test(id);
 }
 
-export default async function onRequest(context) {
-  const request = context.request;
+function genId() {
+  const bytes = new Uint8Array(8);
+  crypto.getRandomValues(bytes);
+  return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function readBodyJson(req) {
+  const text = await req.text();
+  if (text.length > MAX_BODY_BYTES) throw new Error("Payload too large");
+  return text ? JSON.parse(text) : {};
+}
+
+export async function onRequest(context) {
+  const { request, env } = context;
   const url = new URL(request.url);
-  const method = (request.method || "GET").toUpperCase();
-  const path = apiPath(url.pathname);
-
-  // CORS preflight (same-origin mostly, but safe)
-  if (method === "OPTIONS") {
-    return new Response(null, {
-      status: 204,
-      headers: {
-        "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type",
-        "Access-Control-Allow-Credentials": "true",
-      },
-    });
-  }
+  const sub = url.pathname.replace(/^\/api\/?/, "").replace(/\/+$/, "");
+  const method = request.method.toUpperCase();
 
   try {
     // POST /api/login
-    if (path === "/login" && method === "POST") {
-      const env = getEnv(context);
-      const expectedHash = env.AUTH_PASSWORD_HASH;
-      const secret = env.SESSION_SECRET;
+    if (sub === "login" && method === "POST") {
+      const body = await readBodyJson(request);
+      const pwd = String(body.password || "");
+      const expectedHash = (env?.AUTH_PASSWORD_HASH || "").trim().toLowerCase();
+      const secret = env?.SESSION_SECRET;
       if (!expectedHash || !secret) {
-        return json({ error: "auth not configured" }, 500);
+        return err("Server auth env not configured", 500);
       }
-      const body = await parseBody(request);
-      const password = body?.password ?? "";
-      const got = sha256Hex(password);
-      if (!safeEqualHex(got, expectedHash)) {
-        return json({ error: "invalid password" }, 401);
+      const gotHash = await sha256Hex(pwd);
+      if (!safeEqual(gotHash, expectedHash)) {
+        await new Promise((r) => setTimeout(r, 350));
+        return err("密码错误", 401);
       }
-      const token = makeToken({ v: 1, sub: "owner" }, secret, SESSION_TTL_SEC);
-      return json(
-        { ok: true },
-        200,
-        { "Set-Cookie": setCookie(COOKIE_NAME, token, SESSION_TTL_SEC) },
-      );
+      const token = await makeToken(secret);
+      const bootstrap = await getBootstrapPayload();
+      return json({ ok: true, user: "owner", ...bootstrap }, 200, {
+        "set-cookie": makeCookieHeader(token),
+      });
     }
 
     // POST /api/logout
-    if (path === "/logout" && method === "POST") {
-      return json({ ok: true }, 200, { "Set-Cookie": clearCookie(COOKIE_NAME) });
+    if (sub === "logout" && method === "POST") {
+      return json({ ok: true }, 200, {
+        "set-cookie": makeCookieHeader("", 0),
+      });
     }
 
-    // GET /api/me
-    if (path === "/me" && method === "GET") {
-      const auth = requireAuth(context);
-      if (!auth.ok) return json({ ok: false }, auth.status);
-      return json({ ok: true, user: "owner" });
+    // GET /api or GET /api/me (Single-RTT auth check + initial bootstrap)
+    if ((sub === "me" || sub === "") && method === "GET") {
+      const u = await requireAuth(context);
+      if (!u) return json({ authed: false, error: "未登录或会话已过期" }, 401);
+      const bootstrap = await getBootstrapPayload();
+      return json({ ok: true, authed: true, user: "owner", ...bootstrap });
     }
 
-    // All doc routes need auth
-    const auth = requireAuth(context);
-    if (!auth.ok) return json({ error: auth.error }, auth.status);
+    // POST /api (Legacy verify/save compatibility)
+    if (sub === "" && method === "POST") {
+      const body = await readBodyJson(request);
+      if (body.action === "verify" || body.password) {
+        const pwd = String(body.password || request.headers.get("x-share-password") || "");
+        const expectedHash = (env?.AUTH_PASSWORD_HASH || "").trim().toLowerCase();
+        const gotHash = await sha256Hex(pwd);
+        if (!expectedHash || !safeEqual(gotHash, expectedHash)) {
+          return err("密码错误", 401);
+        }
+        const bootstrap = await getBootstrapPayload();
+        return json({ ok: true, user: "owner", ...bootstrap });
+      }
+    }
+
+    // All routes below require auth
+    const user = await requireAuth(context);
+    if (!user) return err("未登录或会话已过期", 401);
 
     // GET /api/docs
-    if (path === "/docs" && method === "GET") {
-      const index = await readIndex();
-      const docs = [...index.docs].sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
-      return json({ docs });
+    if (sub === "docs" && method === "GET") {
+      const idx = await readIndex();
+      const sorted = [...idx.docs].sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
+      return json({ docs: sorted });
     }
 
-    // POST /api/docs  create
-    if (path === "/docs" && method === "POST") {
-      const body = await parseBody(request);
-      const title = String(body?.title || "未命名画布").slice(0, 120);
-      const id = newId();
+    // POST /api/docs (create new doc)
+    if (sub === "docs" && method === "POST") {
+      const body = await readBodyJson(request);
+      const title = String(body.title || "未命名画布").slice(0, 120);
+      const id = genId();
       const now = new Date().toISOString();
       const doc = {
         id,
         title,
         createdAt: now,
         updatedAt: now,
-        elements: [],
-        appState: { viewBackgroundColor: "#ffffff" },
-        files: {},
+        elements: Array.isArray(body.elements) ? body.elements : [],
+        appState: body.appState && typeof body.appState === "object" ? body.appState : {},
+        files: body.files && typeof body.files === "object" ? body.files : {},
       };
-      await store.setJSON(`docs/${id}.json`, doc);
-      const index = await readIndex();
-      index.docs.push({ id, title, createdAt: now, updatedAt: now });
-      await writeIndex(index);
+      await putJson(docKey(id), doc);
+      const idx = await readIndex();
+      idx.docs.unshift({ id, title, createdAt: now, updatedAt: now });
+      await putJson(INDEX_KEY, idx);
       return json({ doc }, 201);
     }
 
-    const docMatch = path.match(/^\/docs\/([a-f0-9]+)$/i);
-    if (docMatch) {
-      const id = docMatch[1];
+    // /api/docs/:id
+    const m = sub.match(/^docs\/([^/]+)$/);
+    if (m) {
+      const id = decodeURIComponent(m[1]);
+      if (!validId(id)) return err("Invalid doc id", 400);
 
-      // GET
       if (method === "GET") {
-        const doc = await store.get(`docs/${id}.json`, { type: "json", consistency: "strong" });
-        if (!doc) return json({ error: "not found" }, 404);
+        const doc = await getJson(docKey(id), null);
+        if (!doc) return err("画布不存在", 404);
         return json({ doc });
       }
 
-      // PUT save scene
-      if (method === "PUT") {
-        const body = await parseBody(request);
-        const existing = await store.get(`docs/${id}.json`, { type: "json", consistency: "strong" });
-        if (!existing) return json({ error: "not found" }, 404);
-        const now = new Date().toISOString();
-        const title = body?.title != null ? String(body.title).slice(0, 120) : existing.title;
-        const doc = {
-          ...existing,
-          title,
-          updatedAt: now,
-          elements: body?.elements ?? existing.elements ?? [],
-          appState: body?.appState ?? existing.appState ?? {},
-          files: body?.files ?? existing.files ?? {},
+      if (method === "PUT" || method === "PATCH") {
+        const body = await readBodyJson(request);
+        const existing = (await getJson(docKey(id), null)) || {
+          id,
+          title: "未命名画布",
+          createdAt: new Date().toISOString(),
+          elements: [],
+          appState: {},
+          files: {},
         };
-        // Strip volatile UI state noise if present
-        if (doc.appState && typeof doc.appState === "object") {
-          const { collaborators, ...rest } = doc.appState;
-          doc.appState = rest;
-        }
-        await store.setJSON(`docs/${id}.json`, doc);
-        const index = await readIndex();
-        const meta = index.docs.find((d) => d.id === id);
-        if (meta) {
-          meta.title = title;
-          meta.updatedAt = now;
-        } else {
-          index.docs.push({ id, title, createdAt: existing.createdAt || now, updatedAt: now });
-        }
-        await writeIndex(index);
-        return json({ ok: true, updatedAt: now, title });
-      }
-
-      // PATCH rename
-      if (method === "PATCH") {
-        const body = await parseBody(request);
-        const title = String(body?.title || "").trim().slice(0, 120);
-        if (!title) return json({ error: "title required" }, 400);
-        const existing = await store.get(`docs/${id}.json`, { type: "json", consistency: "strong" });
-        if (!existing) return json({ error: "not found" }, 404);
         const now = new Date().toISOString();
-        existing.title = title;
-        existing.updatedAt = now;
-        await store.setJSON(`docs/${id}.json`, existing);
-        const index = await readIndex();
-        const meta = index.docs.find((d) => d.id === id);
-        if (meta) {
-          meta.title = title;
-          meta.updatedAt = now;
+        const updated = {
+          ...existing,
+          id,
+          title: body.title !== undefined ? String(body.title).slice(0, 120) : existing.title,
+          elements: Array.isArray(body.elements) ? body.elements : existing.elements,
+          appState: body.appState && typeof body.appState === "object" ? body.appState : existing.appState,
+          files: body.files && typeof body.files === "object" ? body.files : existing.files,
+          updatedAt: now,
+        };
+        await putJson(docKey(id), updated);
+
+        const idx = await readIndex();
+        const entry = idx.docs.find((d) => d.id === id);
+        if (entry) {
+          entry.title = updated.title;
+          entry.updatedAt = now;
+        } else {
+          idx.docs.unshift({ id, title: updated.title, createdAt: updated.createdAt, updatedAt: now });
         }
-        await writeIndex(index);
-        return json({ ok: true, title, updatedAt: now });
+        await putJson(INDEX_KEY, idx);
+        return json({ ok: true, updatedAt: now, title: updated.title });
       }
 
-      // DELETE
       if (method === "DELETE") {
-        await store.delete(`docs/${id}.json`);
-        const index = await readIndex();
-        index.docs = index.docs.filter((d) => d.id !== id);
-        await writeIndex(index);
+        const s = store();
+        await s.delete(docKey(id));
+        const idx = await readIndex();
+        idx.docs = idx.docs.filter((d) => d.id !== id);
+        await putJson(INDEX_KEY, idx);
         return json({ ok: true });
       }
     }
 
-    return json({ error: "Not Found", path, method }, 404);
-  } catch (err) {
-    return json({ error: "server_error", detail: String(err?.message || err) }, 500);
+    return err(`Not found: ${method} /api/${sub}`, 404);
+  } catch (e) {
+    return err(e?.message || "Internal error", 500);
   }
 }

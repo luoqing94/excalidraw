@@ -1,111 +1,89 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useState, useRef, useCallback } from "react";
 import { Excalidraw } from "@excalidraw/excalidraw";
 import "@excalidraw/excalidraw/index.css";
 import { api } from "./api.js";
 
-const SAVE_DEBOUNCE_MS = 1200;
-const TOAST_MS = 2000;
-
-function formatTime(iso) {
+function fmtTime(iso) {
   if (!iso) return "";
   try {
-    return new Date(iso).toLocaleString("zh-CN", { hour12: false });
+    return new Date(iso).toLocaleString("zh-CN", {
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
   } catch {
     return iso;
   }
 }
 
-/** Fingerprint of data we care about for dirty detection (ignore pointer/selection/zoom/scroll). */
-function persistFingerprint(elements, files, appState) {
-  return JSON.stringify({
-    elements: elements || [],
-    files: files || {},
-    viewBackgroundColor: appState?.viewBackgroundColor ?? null,
-    gridSize: appState?.gridSize ?? null,
-  });
-}
-
-/** Strip volatile UI fields before PUT; keep viewport + drawing prefs for restore. */
-function sanitizeAppState(appState) {
-  if (!appState || typeof appState !== "object") return {};
+// Strip runtime-only fields before persisting
+function sanitizeAppState(appState = {}) {
   const {
     collaborators,
-    selectedElementIds,
-    selectedGroupIds,
-    selectedLinearElement,
-    editingElement,
-    editingGroupId,
-    editingLinearElement,
-    isResizing,
-    isRotating,
-    openMenu,
-    openPopup,
-    openSidebar,
-    openDialog,
-    contextMenu,
-    multiElement,
-    newElement,
-    resizingElement,
-    selectionElement,
-    suggestedBindings,
-    frameToHighlight,
-    elementsToHighlight,
-    pendingImageElementId,
-    showHyperlinkPopup,
-    toast,
-    cursorButton,
-    activeEmbeddable,
-    isLoading,
-    errorMessage,
-    ...rest
+    currentChartType,
+    exportBackground,
+    gridSize,
+    name,
+    theme,
+    viewBackgroundColor,
+    zenModeEnabled,
+    zoom,
+    scrollX,
+    scrollY,
   } = appState;
-  return rest;
+  return {
+    currentChartType,
+    exportBackground,
+    gridSize,
+    name,
+    theme,
+    viewBackgroundColor,
+    zenModeEnabled,
+    zoom,
+    scrollX,
+    scrollY,
+  };
 }
 
 export default function App() {
-  const [auth, setAuth] = useState("checking"); // checking | guest | ok
+  const [authChecked, setAuthChecked] = useState(false);
+  const [authed, setAuthed] = useState(false);
   const [password, setPassword] = useState("");
+  const [loginBusy, setLoginBusy] = useState(false);
   const [loginErr, setLoginErr] = useState("");
-  const [loggingIn, setLoggingIn] = useState(false);
 
   const [docs, setDocs] = useState([]);
-  const [activeId, setActiveId] = useState(null);
-  const [title, setTitle] = useState("");
-  const [initialData, setInitialData] = useState(null);
-  const [loadingDoc, setLoadingDoc] = useState(false);
+  const [currentId, setCurrentId] = useState(null);
+  const [currentTitle, setCurrentTitle] = useState("");
+  const [initialScene, setInitialScene] = useState(null); // { key, elements, appState, files }
+  const [status, setStatus] = useState("未打开画布");
+  const [saving, setSaving] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [toast, setToast] = useState(null); // { kind: 'ok'|'err', text }
+  const [toast, setToast] = useState(null); // { text, kind }
 
-  const apiRef = useRef(null);
-  const saveTimer = useRef(null);
-  const toastTimer = useRef(null);
-  const latestPayload = useRef(null);
-  const lastSavedFp = useRef("");
-  const activeIdRef = useRef(null);
-  const titleRef = useRef("");
+  const toastTimerRef = useRef(null);
+  const showToast = useCallback((text, kind = "ok", ms = 1800) => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToast({ text, kind });
+    toastTimerRef.current = setTimeout(() => setToast(null), ms);
+  }, []);
+
+  const excalidrawAPIRef = useRef(null);
+  const sceneCacheRef = useRef({ elements: [], appState: {}, files: {} });
   const dirtyRef = useRef(false);
-  const hydratingRef = useRef(false);
+  const saveTimerRef = useRef(null);
+  const currentIdRef = useRef(null);
+  const currentTitleRef = useRef("");
+  const skipDirtyUntilRef = useRef(0);
 
   useEffect(() => {
-    activeIdRef.current = activeId;
-  }, [activeId]);
+    currentIdRef.current = currentId;
+  }, [currentId]);
+
   useEffect(() => {
-    titleRef.current = title;
-  }, [title]);
-
-  const showToast = useCallback((kind, text) => {
-    if (toastTimer.current) clearTimeout(toastTimer.current);
-    setToast({ kind, text });
-    toastTimer.current = setTimeout(() => {
-      setToast(null);
-      toastTimer.current = null;
-    }, TOAST_MS);
-  }, []);
-
-  const afterDocOpened = useCallback(() => {
-    // Minimal chrome: always collapse chrome when a doc is open (mobile + desktop).
-    setSidebarOpen(false);
-  }, []);
+    currentTitleRef.current = currentTitle;
+  }, [currentTitle]);
 
   const refreshDocs = useCallback(async () => {
     const { docs: list } = await api.listDocs();
@@ -113,245 +91,258 @@ export default function App() {
     return list || [];
   }, []);
 
-  const openDoc = useCallback(
-    async (id) => {
-      if (!id) return;
-      if (saveTimer.current) {
-        clearTimeout(saveTimer.current);
-        saveTimer.current = null;
-      }
-      setLoadingDoc(true);
+  const flushSave = useCallback(async (reason = "自动保存", { notify = false } = {}) => {
+    const id = currentIdRef.current;
+    if (!id) return;
+    if (saveTimerRef.current) {
+      clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+    setSaving(true);
+    setStatus("正在保存到云端…");
+    try {
+      const { elements, appState, files } = sceneCacheRef.current;
+      const res = await api.saveDoc(id, {
+        title: currentTitleRef.current || "未命名画布",
+        elements,
+        appState: sanitizeAppState(appState),
+        files,
+      });
       dirtyRef.current = false;
-      try {
-        const { doc } = await api.getDoc(id);
-        const elements = doc.elements || [];
-        const appState = doc.appState || {};
-        const files = doc.files || {};
-        setActiveId(doc.id);
-        setTitle(doc.title || "未命名画布");
-        setInitialData({
-          elements,
-          appState: {
-            ...appState,
-            collaborators: undefined,
-          },
-          files,
-          scrollToContent: true,
-        });
-        latestPayload.current = { elements, appState, files };
-        lastSavedFp.current = persistFingerprint(elements, files, appState);
-        dirtyRef.current = false;
-        hydratingRef.current = true;
-        afterDocOpened();
-        // Adopt Excalidraw hydrate mutations as baseline; then start dirty tracking.
-        window.setTimeout(() => {
-          hydratingRef.current = false;
-        }, 600);
-      } catch (e) {
-        showToast("err", e.message || "打开失败");
-      } finally {
-        setLoadingDoc(false);
-      }
-    },
-    [afterDocOpened, showToast],
-  );
+      setStatus(`已保存 (${reason}) · ${fmtTime(res.updatedAt)}`);
+      setDocs((prev) => {
+        const next = prev.map((d) =>
+          d.id === id ? { ...d, title: res.title, updatedAt: res.updatedAt } : d,
+        );
+        next.sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
+        return next;
+      });
+      if (notify) showToast("已保存到云端");
+    } catch (e) {
+      setStatus(`保存失败：${e.message}`);
+      if (notify) showToast(`保存失败：${e.message}`, "err", 2800);
+      if (e.status === 401) setAuthed(false);
+    } finally {
+      setSaving(false);
+    }
+  }, [showToast]);
 
+  const applyLoadedDoc = useCallback((doc) => {
+    if (!doc || !doc.id) return;
+    const id = doc.id;
+    skipDirtyUntilRef.current = Date.now() + 900;
+    currentIdRef.current = id;
+    setCurrentId(id);
+    setCurrentTitle(doc.title || "未命名画布");
+    const safeAppState = sanitizeAppState(doc.appState || {});
+    sceneCacheRef.current = {
+      elements: doc.elements || [],
+      appState: safeAppState,
+      files: doc.files || {},
+    };
+    dirtyRef.current = false;
+    setInitialScene({
+      key: `${id}:${doc.updatedAt || Date.now()}`,
+      elements: doc.elements || [],
+      appState: { ...safeAppState, collaborators: new Map() },
+      files: doc.files || {},
+    });
+    setStatus(`已加载 · ${fmtTime(doc.updatedAt)}`);
+    setSidebarOpen(false);
+  }, []);
+
+  const openDoc = useCallback(async (id, { flushPrev = true } = {}) => {
+    if (!id) return;
+    if (flushPrev && dirtyRef.current && currentIdRef.current) {
+      if (saveTimerRef.current) {
+        clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = null;
+      }
+      await flushSave("切换前已保存");
+    }
+    setStatus("加载中…");
+    try {
+      const { doc } = await api.getDoc(id);
+      applyLoadedDoc(doc);
+    } catch (e) {
+      setStatus(`加载失败：${e.message}`);
+    }
+  }, [flushSave, applyLoadedDoc]);
+
+  const hydrateBootstrap = useCallback(async (res) => {
+    if (Array.isArray(res?.docs)) {
+      setDocs(res.docs);
+      if (res.initialDoc && res.initialDoc.id) {
+        applyLoadedDoc(res.initialDoc);
+        return;
+      }
+      if (res.docs.length > 0) {
+        await openDoc(res.docs[0].id, { flushPrev: false });
+      } else {
+        const { doc } = await api.createDoc("默认画布");
+        await refreshDocs();
+        applyLoadedDoc(doc);
+      }
+      return;
+    }
+    const list = await refreshDocs();
+    if (list.length > 0) {
+      await openDoc(list[0].id, { flushPrev: false });
+    } else {
+      const { doc } = await api.createDoc("默认画布");
+      await refreshDocs();
+      await openDoc(doc.id, { flushPrev: false });
+    }
+  }, [applyLoadedDoc, openDoc, refreshDocs]);
+
+  // Initial auth check + 1-RTT bootstrap
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        await api.me();
+        const res = await api.me();
         if (cancelled) return;
-        setAuth("ok");
-        const list = await refreshDocs();
-        if (!cancelled && list.length && !activeIdRef.current) {
-          await openDoc(list[0].id);
-        } else if (!cancelled && !activeIdRef.current) {
-          setSidebarOpen(true);
-        }
+        setAuthed(true);
+        await hydrateBootstrap(res);
       } catch {
-        if (!cancelled) setAuth("guest");
+        if (!cancelled) setAuthed(false);
+      } finally {
+        if (!cancelled) setAuthChecked(true);
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [refreshDocs, openDoc]);
+  }, [hydrateBootstrap]);
 
-  const createDoc = useCallback(async () => {
-    const { doc } = await api.createDoc("未命名画布");
-    await refreshDocs();
-    await openDoc(doc.id);
-  }, [openDoc, refreshDocs]);
-
-  const deleteDoc = useCallback(async () => {
-    if (!activeId) return;
-    if (!confirm("确定删除当前画布？此操作不可撤销。")) return;
-    if (saveTimer.current) {
-      clearTimeout(saveTimer.current);
-      saveTimer.current = null;
-    }
-    await api.deleteDoc(activeId);
-    setActiveId(null);
-    setInitialData(null);
-    setTitle("");
-    latestPayload.current = null;
-    lastSavedFp.current = "";
-    dirtyRef.current = false;
-    setSidebarOpen(true);
-    await refreshDocs();
-  }, [activeId, refreshDocs]);
-
-  const flushSave = useCallback(
-    async ({ force = false } = {}) => {
-      const id = activeIdRef.current;
-      const payload = latestPayload.current;
-      if (!id || !payload) return;
-      if (!force && !dirtyRef.current) return;
-
-      const elements = payload.elements || [];
-      const files = payload.files || {};
-      const appState = sanitizeAppState(payload.appState);
-      const fp = persistFingerprint(elements, files, appState);
-
-      try {
-        const res = await api.saveDoc(id, {
-          title: titleRef.current,
-          elements,
-          appState,
-          files,
-        });
-        lastSavedFp.current = fp;
-        dirtyRef.current = false;
-        showToast("ok", "已保存");
-        setDocs((prev) =>
-          prev
-            .map((d) =>
-              d.id === id
-                ? { ...d, title: titleRef.current, updatedAt: res.updatedAt }
-                : d,
-            )
-            .sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || "")),
-        );
-      } catch (e) {
-        showToast("err", e.message || "保存失败");
+  // Ctrl+S / Cmd+S manual save
+  useEffect(() => {
+    const onKey = (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        flushSave("手动保存", { notify: true });
       }
-    },
-    [showToast],
-  );
-
-  const scheduleSave = useCallback(() => {
-    if (saveTimer.current) clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(() => {
-      saveTimer.current = null;
-      flushSave();
-    }, SAVE_DEBOUNCE_MS);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   }, [flushSave]);
 
-  const onChange = useCallback(
+  const scheduleAutoSave = useCallback(() => {
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      saveTimerRef.current = null;
+      if (dirtyRef.current) flushSave("自动保存");
+    }, 1800);
+  }, [flushSave]);
+
+  const onSceneChange = useCallback(
     (elements, appState, files) => {
-      if (!activeIdRef.current) return;
-      latestPayload.current = { elements, appState, files };
-      const fp = persistFingerprint(elements, files, appState);
-      if (fp === lastSavedFp.current) {
-        // No persistable change (selection / zoom / scroll / pointer only).
-        return;
-      }
-      if (hydratingRef.current) {
-        // Initial Excalidraw hydrate often rewrites element defaults — adopt as saved.
-        lastSavedFp.current = fp;
-        dirtyRef.current = false;
-        return;
-      }
+      sceneCacheRef.current = { elements, appState, files };
+      if (!currentIdRef.current) return;
+      if (Date.now() < skipDirtyUntilRef.current) return;
       dirtyRef.current = true;
-      scheduleSave();
+      setStatus("有未保存更改…");
+      scheduleAutoSave();
     },
-    [scheduleSave],
+    [scheduleAutoSave],
   );
 
-  const onTitleBlur = useCallback(async () => {
-    if (!activeId) return;
-    const t = title.trim() || "未命名画布";
-    setTitle(t);
-    try {
-      await api.renameDoc(activeId, t);
-      await flushSave({ force: true });
-      await refreshDocs();
-    } catch (e) {
-      showToast("err", e.message || "重命名失败");
-    }
-  }, [activeId, title, flushSave, refreshDocs, showToast]);
+  const onTitleChange = (e) => {
+    const v = e.target.value;
+    setCurrentTitle(v);
+    if (!currentIdRef.current) return;
+    dirtyRef.current = true;
+    setStatus("标题待保存…");
+    scheduleAutoSave();
+  };
 
-  const onLogin = async (e) => {
-    e.preventDefault();
-    setLoggingIn(true);
-    setLoginErr("");
+  const onNewDoc = async () => {
+    const name = window.prompt("新画布名称：", `画布 ${docs.length + 1}`);
+    if (name === null) return;
+    if (dirtyRef.current && currentIdRef.current) {
+      await flushSave("新建前已保存");
+    }
     try {
-      await api.login(password);
-      setAuth("ok");
-      setPassword("");
+      const { doc } = await api.createDoc(name.trim() || "未命名画布");
+      await refreshDocs();
+      applyLoadedDoc(doc);
+    } catch (e) {
+      alert(`新建失败：${e.message}`);
+    }
+  };
+
+  const onDeleteDoc = async () => {
+    if (!currentId) return;
+    if (!window.confirm(`确定删除画布「${currentTitle || "未命名"}」吗？此操作不可撤销。`)) return;
+    try {
+      await api.deleteDoc(currentId);
       const list = await refreshDocs();
-      if (list.length) {
-        await openDoc(list[0].id);
+      if (list.length > 0) {
+        await openDoc(list[0].id, { flushPrev: false });
       } else {
-        setSidebarOpen(true);
+        setCurrentId(null);
+        setInitialScene(null);
+        setStatus("已删除，暂无画布");
       }
-    } catch (err) {
-      setLoginErr(err.message === "invalid password" ? "密码错误" : err.message || "登录失败");
-    } finally {
-      setLoggingIn(false);
+    } catch (e) {
+      alert(`删除失败：${e.message}`);
     }
   };
 
   const onLogout = async () => {
-    if (saveTimer.current) {
-      clearTimeout(saveTimer.current);
-      saveTimer.current = null;
+    if (dirtyRef.current && currentIdRef.current) {
+      await flushSave("退出前已保存");
     }
-    if (dirtyRef.current) {
-      await flushSave({ force: true });
-    }
-    await api.logout();
-    setAuth("guest");
-    setDocs([]);
-    setActiveId(null);
-    setInitialData(null);
-    setSidebarOpen(true);
-    latestPayload.current = null;
-    lastSavedFp.current = "";
-    dirtyRef.current = false;
+    await api.logout().catch(() => {});
+    setAuthed(false);
+    setCurrentId(null);
+    setInitialScene(null);
   };
 
-  const excalidrawKey = useMemo(() => activeId || "none", [activeId]);
+  const onLogin = async (e) => {
+    e.preventDefault();
+    setLoginBusy(true);
+    setLoginErr("");
+    try {
+      const res = await api.login(password);
+      setPassword("");
+      setAuthed(true);
+      await hydrateBootstrap(res);
+    } catch (err) {
+      setLoginErr(err.message || "登录失败");
+    } finally {
+      setLoginBusy(false);
+    }
+  };
 
-  const showSidebar = sidebarOpen || !activeId;
-  const appClass = [
-    "app",
-    showSidebar ? "sidebar-open" : "sidebar-collapsed",
-    activeId ? "has-doc" : "no-doc",
-  ].join(" ");
-
-  if (auth === "checking") {
-    return <div className="empty">加载中…</div>;
+  if (!authChecked) {
+    return (
+      <div className="login-wrap">
+        <div className="login-card">
+          <h1>Excalidraw Sync</h1>
+          <div className="sub">正在检查登录状态…</div>
+        </div>
+      </div>
+    );
   }
 
-  if (auth === "guest") {
+  if (!authed) {
     return (
       <div className="login-wrap">
         <form className="login-card" onSubmit={onLogin}>
-          <h1>Excalidraw Sync</h1>
-          <p className="sub">单用户云端画布 · EdgeOne Blob 自动存盘</p>
-          <p className="err">{loginErr}</p>
+          <h1>✏️ Excalidraw 云画布</h1>
+          <div className="sub">请输入访问密码解锁你的多文档云端画布</div>
           <input
             type="password"
             placeholder="访问密码"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             autoFocus
-            autoComplete="current-password"
+            required
           />
-          <button type="submit" disabled={loggingIn || !password}>
-            {loggingIn ? "登录中…" : "登录"}
+          <div className="err">{loginErr}</div>
+          <button type="submit" disabled={loginBusy}>
+            {loginBusy ? "正在验证…" : "进入画布"}
           </button>
         </form>
       </div>
@@ -359,122 +350,112 @@ export default function App() {
   }
 
   return (
-    <div className={appClass}>
-      {showSidebar && activeId && (
+    <div className={`app ${currentId ? "has-doc" : "no-doc"} ${sidebarOpen ? "sidebar-open" : "sidebar-collapsed"}`}>
+      {currentId && sidebarOpen && (
         <button
           type="button"
           className="sidebar-backdrop"
-          aria-label="关闭菜单"
+          aria-label="关闭侧栏"
           onClick={() => setSidebarOpen(false)}
         />
       )}
-
-      <aside className={`sidebar ${showSidebar ? "is-open" : "is-closed"}`}>
+      <aside className={`sidebar ${sidebarOpen ? "is-open" : "is-closed"}`}>
         <div className="sidebar-head">
-          <h2>{activeId ? "菜单" : "我的画布"}</h2>
-          {activeId && (
+          <h2>✏️ 我的画布</h2>
+          {currentId && (
             <button
               className="btn secondary"
-              type="button"
+              style={{ padding: "6px 10px", fontSize: "0.78rem" }}
               onClick={() => setSidebarOpen(false)}
-              title="收起"
+              title="收起菜单"
             >
               收起
             </button>
           )}
-          <button className="btn secondary" type="button" onClick={onLogout} title="退出">
+          <button
+            className="btn secondary"
+            style={{ padding: "6px 10px", fontSize: "0.78rem" }}
+            onClick={onLogout}
+            title="退出登录"
+          >
             退出
           </button>
         </div>
-
-        {activeId && (
+        {currentId && (
           <div className="panel-doc-meta">
             <input
               className="title-input"
-              value={title}
-              placeholder="画布名称"
-              onChange={(e) => setTitle(e.target.value)}
-              onBlur={onTitleBlur}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") e.currentTarget.blur();
-              }}
+              value={currentTitle}
+              onChange={onTitleChange}
+              placeholder="画布标题"
             />
             <button
               className="btn"
-              type="button"
-              onClick={() => flushSave({ force: true })}
+              onClick={() => flushSave("手动保存", { notify: true })}
+              disabled={saving}
             >
-              立即保存
+              {saving ? "保存中…" : "💾 保存到云端"}
             </button>
           </div>
         )}
-
         <div className="sidebar-actions">
-          <button className="btn" type="button" onClick={createDoc}>
-            新建
+          <button className="btn" onClick={onNewDoc}>
+            ＋ 新建画布
           </button>
-          <button className="btn danger" type="button" onClick={deleteDoc} disabled={!activeId}>
+          <button className="btn danger" onClick={onDeleteDoc} disabled={!currentId}>
             删除
           </button>
         </div>
         <div className="doc-list">
-          {docs.length === 0 && (
-            <div className="empty" style={{ height: "auto", padding: 16 }}>
-              还没有画布，点「新建」开始
-            </div>
-          )}
           {docs.map((d) => (
             <button
               key={d.id}
               type="button"
-              className={`doc-item ${d.id === activeId ? "active" : ""}`}
+              className={`doc-item ${d.id === currentId ? "active" : ""}`}
               onClick={() => openDoc(d.id)}
             >
               <div className="title">{d.title || "未命名画布"}</div>
-              <div className="meta">{formatTime(d.updatedAt)}</div>
+              <div className="meta">更新于 {fmtTime(d.updatedAt)}</div>
             </button>
           ))}
         </div>
       </aside>
 
       <main className="main">
-        {activeId && (
+        {currentId && (
           <button
             type="button"
             className="fab-menu"
-            title="画布菜单"
-            aria-label="打开画布菜单"
             onClick={() => setSidebarOpen((v) => !v)}
+            title="画布菜单（切换 / 新建 / 保存）"
+            aria-label="画布菜单"
           >
             ⋯
           </button>
         )}
-
         {toast && (
-          <div className={`toast toast-${toast.kind}`} role="status">
+          <div className={`toast toast-${toast.kind}`}>
             {toast.text}
           </div>
         )}
 
         <div className="canvas">
-          {!activeId && <div className="empty">点「新建」开始，或从列表打开画布</div>}
-          {activeId && loadingDoc && <div className="empty">打开画布中…</div>}
-          {activeId && !loadingDoc && initialData && (
+          {initialScene ? (
             <Excalidraw
-              key={excalidrawKey}
+              key={initialScene.key}
+              excalidrawAPI={(apiInstance) => {
+                excalidrawAPIRef.current = apiInstance;
+              }}
+              initialData={{
+                elements: initialScene.elements,
+                appState: initialScene.appState,
+                files: initialScene.files,
+              }}
+              onChange={onSceneChange}
               langCode="zh-CN"
-              excalidrawAPI={(api) => {
-                apiRef.current = api;
-              }}
-              initialData={initialData}
-              onChange={onChange}
-              UIOptions={{
-                canvasActions: {
-                  loadScene: false,
-                  saveToActiveFile: false,
-                },
-              }}
             />
+          ) : (
+            <div className="empty">请从左侧选择或新建一个画布</div>
           )}
         </div>
       </main>

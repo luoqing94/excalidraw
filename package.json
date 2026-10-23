@@ -1,10 +1,11 @@
 {
   "name": "excalidraw-sync",
-  "private": true,
   "version": "1.0.0",
+  "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "prebuild": "rm -rf public/fonts && mkdir -p public/fonts && cp -R node_modules/@excalidraw/excalidraw/dist/prod/fonts/. public/fonts/ && cp public/fonts/Virgil/Virgil-Regular.woff2 public/fonts/Virgil.woff2 && cp public/fonts/Cascadia/CascadiaCode-Regular.woff2 public/fonts/Cascadia.woff2",
     "build": "vite build",
     "preview": "vite preview"
   },
@@ -17,8 +18,5 @@
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.4",
     "vite": "^5.4.11"
-  },
-  "allowScripts": {
-    "esbuild@0.21.5": true
   }
 }

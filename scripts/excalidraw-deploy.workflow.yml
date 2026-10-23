@@ -1,0 +1,45 @@
+name: Deploy EdgeOne Excalidraw
+
+on:
+  push:
+    branches: [custom/live]
+  workflow_dispatch:
+
+concurrency:
+  group: excalidraw-edgeone-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies and EdgeOne CLI
+        run: |
+          npm ci --no-audit --no-fund
+          npm i -g edgeone@latest
+
+      - name: Restore Teo verification token
+        env:
+          TEO_VERIFICATION_TOKEN: ${{ secrets.TEO_VERIFICATION_TOKEN }}
+        run: |
+          if [ -n "$TEO_VERIFICATION_TOKEN" ]; then
+            mkdir -p public/.well-known/teo-verification
+            printf '%s' "$TEO_VERIFICATION_TOKEN" > public/.well-known/teo-verification/zovu09n4zs.txt
+          fi
+
+      - name: Build frontend and self-hosted fonts
+        run: npm run build
+
+      - name: Deploy to EdgeOne Pages
+        env:
+          EDGEONE_API_TOKEN: ${{ secrets.EDGEONE_API_TOKEN }}
+        run: edgeone makers deploy . -n excalidraw -t "$EDGEONE_API_TOKEN" -e production
